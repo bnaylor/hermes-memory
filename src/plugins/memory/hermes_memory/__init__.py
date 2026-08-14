@@ -48,6 +48,9 @@ FACT_STORE_SCHEMA = {
         "• related — What connects to an entity? Structural adjacency.\n"
         "• reason — Compositional: facts connected to MULTIPLE entities simultaneously.\n"
         "• contradict — Memory hygiene: find facts making conflicting claims.\n"
+        "• retract — Mark a fact no longer true (no replacement).\n"
+        "• supersede — Mark a fact replaced by another (records lineage).\n"
+        "• restore — Re-activate a retracted/superseded fact.\n"
         "• update/remove/list — CRUD operations.\n\n"
         "IMPORTANT: Before answering questions about the user, ALWAYS probe or reason first."
     ),
@@ -56,13 +59,15 @@ FACT_STORE_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "search", "probe", "related", "reason", "contradict", "update", "remove", "list"],
+                "enum": ["add", "search", "probe", "related", "reason", "contradict", "retract", "supersede", "restore", "update", "remove", "list"],
             },
             "content": {"type": "string", "description": "Fact content (required for 'add')."},
             "query": {"type": "string", "description": "Search query (required for 'search')."},
             "entity": {"type": "string", "description": "Entity name for 'probe'/'related'."},
             "entities": {"type": "array", "items": {"type": "string"}, "description": "Entity names for 'reason'."},
-            "fact_id": {"type": "integer", "description": "Fact ID for 'update'/'remove'."},
+            "fact_id": {"type": "integer", "description": "Fact ID for 'update'/'remove'/'retract'/'supersede'/'restore'."},
+            "by_fact_id": {"type": "integer", "description": "Replacing fact ID for 'supersede'."},
+            "supersedes": {"type": "integer", "description": "Old fact ID to supersede on 'add'."},
             "category": {"type": "string", "enum": ["user_pref", "project", "tool", "general", "infrastructure"]},
             "tags": {"type": "string", "description": "Comma-separated tags."},
             "trust_delta": {"type": "number", "description": "Trust adjustment for 'update'."},
@@ -441,6 +446,7 @@ class HermesMemoryProvider(MemoryProvider):
                     args["content"],
                     category=args.get("category", "general"),
                     tags=args.get("tags", ""),
+                    supersedes=args.get("supersedes"),
                 )
                 return json.dumps({"fact_id": fact_id, "status": "added"})
 
@@ -500,6 +506,18 @@ class HermesMemoryProvider(MemoryProvider):
             elif action == "remove":
                 removed = store.remove_fact(int(args["fact_id"]))
                 return json.dumps({"removed": removed})
+
+            elif action == "retract":
+                result = store.retract_fact(int(args["fact_id"]))
+                return json.dumps(result)
+
+            elif action == "supersede":
+                result = store.supersede_fact(int(args["fact_id"]), int(args["by_fact_id"]))
+                return json.dumps(result)
+
+            elif action == "restore":
+                result = store.restore_fact(int(args["fact_id"]))
+                return json.dumps(result)
 
             elif action == "list":
                 facts = store.list_facts(
