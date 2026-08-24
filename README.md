@@ -123,6 +123,30 @@ This is the runtime path for shared knowledge.  OKF bundles handle curated,
 versioned facts; the broadcast pipeline handles facts discovered at runtime and
 pushed peer-to-peer.
 
+### Trap: the ingest hook silently skips unless allowlisted
+
+The `pre_llm_call` hook that drains the spool into the store is a **shell
+hook**, and Hermes skips un-allowlisted shell hooks *silently*.  If
+`hooks_auto_accept` is `false` (the default) and the hook command is not
+approve-allowlisted, the gateway logs a `WARNING ... not allowlisted — skipped`
+each turn but the fact store **freezes with no error**: no new facts land, and
+nothing is written or read.  This is exactly what happened to the Clomp host
+(romar#186): the store went ~7 days without a write, and the symptom surfaced
+only as "no `fact_store` recall" — not as a crash.
+
+Before relying on the broadcast pipeline, verify the hook is actually running:
+
+```bash
+grep -c 'not allowlisted' ~/.hermes/logs/gateway.log   # any count > 0 means it's skipping
+# and confirm the spool is being drained:
+wc -l ~/.hermes/memory_spool.jsonl                      # 0 lines = nothing flowing
+```
+
+Fix is one of: `hooks_auto_accept: true`, an explicit allowlist entry for
+`python3 ~/.hermes/hooks/ingest-memory-spool/handler.py`, or approving the hook
+at the next TTY prompt.  The spool-health check in `scripts/fact-store-inventory.py`
+flags a spool with old lines for the same reason.
+
 ## Installation
 
 Drop the `src/plugins/memory/hermes_memory/` directory into your Hermes plugins
