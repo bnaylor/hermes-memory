@@ -345,7 +345,7 @@ if __name__ == "__main__":
     from pathlib import Path
 
     parser = argparse.ArgumentParser(
-        description="Ingest an OKF bundle into the Holographic fact store."
+        description="Ingest an OKF bundle into the fact store."
     )
     parser.add_argument(
         "bundle_path",

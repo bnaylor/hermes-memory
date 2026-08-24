@@ -1,7 +1,7 @@
 """hermes-memory-store — hermes memory plugin using MemoryProvider interface.
 
 Registers as a MemoryProvider plugin, giving the agent structured fact storage
-with entity resolution, trust scoring, and HRR-based compositional retrieval.
+with entity resolution and trust scoring.
 
 Original plugin by dusterbloom (PR #2351), adapted to the MemoryProvider ABC.
 
@@ -113,7 +113,7 @@ def _load_plugin_config() -> dict:
 # ---------------------------------------------------------------------------
 
 class HermesMemoryProvider(MemoryProvider):
-    """Hermes memory with structured facts, entity resolution, and HRR retrieval."""
+    """Hermes memory with structured facts, entity resolution, and trust scoring."""
 
     def __init__(self, config: dict | None = None):
         self._config = config or _load_plugin_config()
@@ -128,7 +128,7 @@ class HermesMemoryProvider(MemoryProvider):
         return "hermes-memory"
 
     def is_available(self) -> bool:
-        return True  # SQLite is always available, numpy is optional
+        return True  # SQLite is always available
 
     def save_config(self, values, hermes_home):
         """Write config to config.yaml under plugins.hermes-memory-store."""
@@ -154,7 +154,6 @@ class HermesMemoryProvider(MemoryProvider):
             {"key": "db_path", "description": "SQLite database path", "default": _default_db},
             {"key": "auto_extract", "description": "Auto-extract facts at session end", "default": "false", "choices": ["true", "false"]},
             {"key": "default_trust", "description": "Default trust score for new facts", "default": "0.5"},
-            {"key": "hrr_dim", "description": "HRR vector dimensions", "default": "1024"},
             {"key": "okf_bundle_path",        "description": "OKF bundle path for infrastructure facts",              "default": "/shared/agents/common/infrastructure/"},
             {"key": "bootstrap_inject_limit", "description": "Max facts injected after context compression",          "default": "15"},
             {"key": "bootstrap_min_trust",    "description": "Minimum trust score for post-compaction injection",     "default": "0.7"},
@@ -173,16 +172,12 @@ class HermesMemoryProvider(MemoryProvider):
             db_path = db_path.replace("$HERMES_HOME", _hermes_home)
             db_path = db_path.replace("${HERMES_HOME}", _hermes_home)
         default_trust = float(self._config.get("default_trust", 0.5))
-        hrr_dim = int(self._config.get("hrr_dim", 1024))
-        hrr_weight = float(self._config.get("hrr_weight", 0.3))
         temporal_decay = int(self._config.get("temporal_decay_half_life", 0))
 
-        self._store = MemoryStore(db_path=db_path, default_trust=default_trust, hrr_dim=hrr_dim)
+        self._store = MemoryStore(db_path=db_path, default_trust=default_trust)
         self._retriever = FactRetriever(
             store=self._store,
             temporal_decay_half_life=temporal_decay,
-            hrr_weight=hrr_weight,
-            hrr_dim=hrr_dim,
         )
         self._session_id = session_id
 
@@ -208,14 +203,14 @@ class HermesMemoryProvider(MemoryProvider):
 
         if total == 0:
             memory_block = (
-                "# Holographic Memory\n"
+                "# Fact Store Memory\n"
                 "Active. Empty fact store — proactively add facts the user would expect you to remember.\n"
                 "Use fact_store(action='add') to store durable structured facts about people, projects, preferences, decisions.\n"
                 "Use fact_feedback to rate facts after using them (trains trust scores)."
             )
         else:
             memory_block = (
-                f"# Holographic Memory\n"
+                f"# Fact Store Memory\n"
                 f"Active. {total} facts stored with entity resolution and trust scoring.\n"
                 f"Use fact_store to search, probe entities, reason across entities, or add facts.\n"
                 f"Use fact_feedback to rate facts after using them (trains trust scores)."
@@ -265,7 +260,7 @@ class HermesMemoryProvider(MemoryProvider):
                 for r in regular_facts[:5]:
                     trust = r.get("trust_score", r.get("trust", 0))
                     reg_lines.append(f"- [{trust:.1f}] {r.get('content', '')}")
-                reg_lines.insert(0, "## Holographic Memory")
+                reg_lines.insert(0, "## Fact Store Memory")
                 parts.append("\n".join(reg_lines))
 
             # Checkpoint facts section — structured latent-context block
@@ -336,11 +331,11 @@ class HermesMemoryProvider(MemoryProvider):
 
             return "\n\n".join(parts) if parts else ""
         except Exception as e:
-            logger.debug("Holographic prefetch failed: %s", e)
+            logger.debug("Fact store prefetch failed: %s", e)
             return ""
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        # Holographic memory stores explicit facts via tools, not auto-sync.
+        # The fact store persists explicit facts via tools, not auto-sync.
         # The on_session_end hook handles auto-extraction if configured.
         pass
 
@@ -427,7 +422,7 @@ class HermesMemoryProvider(MemoryProvider):
                 category = "user_pref" if target == "user" else "general"
                 self._store.add_fact(content, category=category)
             except Exception as e:
-                logger.debug("Holographic memory_write mirror failed: %s", e)
+                logger.debug("Fact store memory_write mirror failed: %s", e)
 
     def shutdown(self) -> None:
         self._store = None

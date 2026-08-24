@@ -1,12 +1,11 @@
 # hermes-memory
 
 A [Hermes](https://hermes-agent.nousresearch.com) memory plugin that gives
-agents a structured, queryable fact store backed by SQLite and an optional
-[Holographic Reduced Representations](https://en.wikipedia.org/wiki/Holographic_reduced_representation)
-(HRR) layer. Built to solve two problems: agents losing coherent working
-knowledge after context compaction, and the need to convey context across
-sessions transparently — extending factual recollection without hitting the
-cold tier and blowing out the context window with large files.
+agents a structured, queryable fact store backed by SQLite. Built to solve two
+problems: agents losing coherent working knowledge after context compaction,
+and the need to convey context across sessions transparently — extending
+factual recollection without hitting the cold tier and blowing out the context
+window with large files.
 
 ## Architecture
 
@@ -32,20 +31,15 @@ The plugin registers as a `MemoryProvider` and exposes two tools to the agent:
 Facts are stored in SQLite with:
 - Full-text search (FTS5) for keyword retrieval
 - Entity extraction and resolution (facts are linked to the entities they mention)
-- HRR vectors per fact (requires `numpy`) enabling algebraic queries
 - Trust scores that drift up/down based on feedback
 
-Without `numpy`, retrieval falls back to FTS5 + Jaccard similarity — HRR-based
-actions (`probe`, `related`, `reason`, `contradict`) degrade to keyword search.
-The HRR layer was intentionally kept opt-in: in practice it injected stale and
-incorrect facts with no audit trail — both agents found it unreliable and
-impossible to tune. The retrieval pipeline was re-weighted to FTS5+Jaccard as
-the primary path, with HRR gated behind `numpy` as an available-but-unused
-upgrade option.
+Retrieval is FTS5 + Jaccard similarity. The `probe`/`related`/`reason`/`contradict`
+actions all operate over the same FTS5+Jaccard pipeline (`probe`/`related` search
+by entity name, `reason` joins entity names into a keyword query, `contradict`
+uses Jaccard entity overlap + Jaccard content divergence).
 
-On every turn, `prefetch()` runs hybrid retrieval (FTS5 + Jaccard + HRR cosine
-similarity when numpy is present) against the user's message and injects
-relevant facts into the context block.
+On every turn, `prefetch()` runs hybrid retrieval (FTS5 + Jaccard) against the
+user's message and injects relevant facts into the context block.
 
 ### Compaction Recovery
 
@@ -141,7 +135,6 @@ plugins:
     auto_extract: false
     default_trust: 0.5
     min_trust_threshold: 0.3
-    hrr_dim: 1024
     bootstrap_inject_limit: 15
     bootstrap_min_trust: 0.7
     bootstrap_shadow: false
@@ -152,19 +145,16 @@ The plugin key `hermes-memory-store` matches the module's registration name
 (`__init__.py` → `register()` → provider name `hermes-memory`). The directory
 name `hermes_memory` is the Python module path.
 
-`numpy` is optional. Without it, HRR operations fall back to FTS5+Jaccard and
-`probe`/`related`/`reason`/`contradict` degrade to keyword search.
-
 ## The `fact_store` Tool
 
 | Action | Purpose |
 |---|---|
 | `add` | Store a fact. Requires `content`. Optional `category`, `tags`. |
 | `search` | Keyword lookup across content and tags. |
-| `probe` | All facts about a specific entity (algebraic with numpy, keyword without). |
-| `related` | Facts structurally connected to an entity. |
-| `reason` | Facts connected to **all** of a list of entities simultaneously — compositional AND query. |
-| `contradict` | Find fact pairs making conflicting claims about the same entities. |
+| `probe` | All facts about a specific entity (keyword search on the entity name). |
+| `related` | Facts connected to an entity (keyword search on the entity name). |
+| `reason` | Facts matching a list of entities — joins entity names into a keyword query. |
+| `contradict` | Find fact pairs making conflicting claims about the same entities (Jaccard entity overlap + content divergence). |
 | `update` | Modify content, tags, category, or adjust trust by delta. |
 | `remove` | Delete a fact by ID. |
 | `list` | Browse facts by category/trust, sorted by trust descending. |
@@ -182,29 +172,6 @@ fact_store(action="reason", entities=["peppi", "backend"])
 fact_store(action="search", query="deploy process")
 ```
 
-## HRR Internals (numpy required)
-
-Phase vectors represent concepts as angles in [0, 2π). The algebra:
-
-- **bind** (circular convolution) — associates two concepts; result is
-  quasi-orthogonal to both
-- **unbind** (circular correlation) — retrieves one concept given the other
-- **bundle** (circular mean) — merges multiple concepts; result is similar to
-  each
-
-Each fact is encoded as:
-```
-bind(encode_text(content), ROLE_CONTENT) + Σ bind(encode_atom(entity), ROLE_ENTITY)
-```
-
-This enables `probe` to ask "unbind ROLE_ENTITY×entity from the memory bank —
-what content comes out?" without any keyword matching. Atoms are generated
-deterministically from SHA-256, stable across processes and machines.
-
-Memory bank SNR degrades as `sqrt(dim / n_facts)` — below SNR 2.0
-(n_facts > dim/4), the plugin logs a warning. Default dim=1024 handles ~256
-facts cleanly per category bank.
-
 ## Configuration Reference
 
 | Key | Default | Description |
@@ -213,7 +180,6 @@ facts cleanly per category bank.
 | `auto_extract` | `false` | Auto-extract facts from conversation at session end. |
 | `default_trust` | `0.5` | Starting trust score for new facts. |
 | `min_trust_threshold` | `0.3` | Prefetch ignores facts below this score. |
-| `hrr_dim` | `1024` | HRR vector dimensions. Ignored without numpy. |
 | `okf_bundle_path` | `/shared/agents/common/infrastructure/` | Default bundle for OKF ingestion. |
 | `bootstrap_inject_limit` | `15` | Max facts re-injected after compaction. |
 | `bootstrap_min_trust` | `0.7` | Minimum trust for compaction re-injection. |
@@ -229,8 +195,7 @@ src/
     hermes_memory/
       __init__.py                            # MemoryProvider plugin + fact_store tool
       store.py                               # SQLite schema, CRUD, entity resolution
-      retrieval.py                           # FTS5 + Jaccard + HRR retrieval
-      holographic.py                         # HRR vector algebra (numpy optional)
+      retrieval.py                           # FTS5 + Jaccard retrieval
 tests/
   test_okf_ingest.py                         # 30 tests (parsing, trust, deprecation,
                                              #   staleness, orphan repair, CLI)
