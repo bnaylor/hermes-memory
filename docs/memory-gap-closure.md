@@ -8,7 +8,8 @@
 
 > **Status note:** This document is retained as the design record. The six phases
 > below are all shipped. See "Implementation status" and "Post-implementation
-> findings" for what landed and what remains open (notably Gap #6 — durability).
+> findings" for what landed. The one post-incident gap — Gap #6 (durability) — is
+> implemented via PR #12.
 
 ## Implementation status
 
@@ -242,11 +243,11 @@ The read path was independently broken: `memory.provider: hermes-memory` (hyphen
 
 **Why this plan missed it:** the closure plan scoped *measurement / interface / staleness*. Durability was implicitly assumed to be covered by JetStream retention — an assumption the incident falsified. JetStream is a 7-day message bus, not a durable fact store.
 
-**Proposed fix (not yet implemented — needs scromp's decision):**
-- Weekly `memory_store.db` snapshot (e.g. SQLite `VACUUM INTO` to a timestamped file) to NFS or git, scheduled alongside the existing `fact-store-inventory` cron, with retention (keep last N).
-- Codify "JetStream is transport, not backup" in the inter-agent memory doc so the false-recovery assumption doesn't recur.
+**Fix (implemented — PR #12, 2026-08-24):**
+- `scripts/fact-store-backup.py` — `VACUUM INTO` snapshot to `/shared/agents/<agent>/backups/fact-store/` (700 owner-only), daily `0 3 * * *`, keep last 7, self-verifying (integrity + row count before finalize). Design: `docs/fact-store-backup-design.md`. Decision: NFS (not git), VACUUM-only (no WAL checkpoint).
+- "JetStream is transport, not backup" codified in the `fact-store-discipline` skill.
 
-**Status:** Open.
+**Status:** ✅ Implemented. Deployed on mink (cron `fact-store-backup`); Rune deploying on diffuser. Tracks romar#200.
 
 ---
 
