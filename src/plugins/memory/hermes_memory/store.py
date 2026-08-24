@@ -8,11 +8,6 @@ import sqlite3
 import threading
 from pathlib import Path
 
-try:
-    from . import holographic as hrr
-except ImportError:
-    import holographic as hrr  # type: ignore[no-redef]
-
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts (
     fact_id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -23,8 +18,7 @@ CREATE TABLE IF NOT EXISTS facts (
     retrieval_count INTEGER DEFAULT 0,
     helpful_count   INTEGER DEFAULT 0,
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    hrr_vector      BLOB
+    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS entities (
@@ -64,15 +58,6 @@ CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE ON facts BEGIN
     INSERT INTO facts_fts(rowid, content, tags)
         VALUES (new.fact_id, new.content, new.tags);
 END;
-
-CREATE TABLE IF NOT EXISTS memory_banks (
-    bank_id    INTEGER PRIMARY KEY AUTOINCREMENT,
-    bank_name  TEXT NOT NULL UNIQUE,
-    vector     BLOB NOT NULL,
-    dim        INTEGER NOT NULL,
-    fact_count INTEGER DEFAULT 0,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
 """
 
 # Trust adjustment constants
@@ -102,7 +87,6 @@ class MemoryStore:
         self,
         db_path: "str | Path | None" = None,
         default_trust: float = 0.5,
-        hrr_dim: int = 1024,
     ) -> None:
         if db_path is None:
             from hermes_constants import get_hermes_home
@@ -110,8 +94,6 @@ class MemoryStore:
         self.db_path = Path(db_path).expanduser()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.default_trust = _clamp_trust(default_trust)
-        self.hrr_dim = hrr_dim
-        self._hrr_available = hrr._HAS_NUMPY
         self._conn: sqlite3.Connection = sqlite3.connect(
             str(self.db_path),
             check_same_thread=False,
@@ -133,10 +115,6 @@ class MemoryStore:
         from hermes_state import apply_wal_with_fallback
         apply_wal_with_fallback(self._conn, db_label="memory_store.db (hermes-memory)")
         self._conn.executescript(_SCHEMA)
-        # Migrate: add hrr_vector column if missing (safe for existing databases)
-        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}
-        if "hrr_vector" not in columns:
-            self._conn.execute("ALTER TABLE facts ADD COLUMN hrr_vector BLOB")
         self._conn.commit()
 
     # ------------------------------------------------------------------
@@ -181,10 +159,6 @@ class MemoryStore:
             for name in self._extract_entities(content):
                 entity_id = self._resolve_entity(name)
                 self._link_fact_entity(fact_id, entity_id)
-
-            # Compute HRR vector after entity linking
-            self._compute_hrr_vector(fact_id, content)
-            self._rebuild_bank(category)
 
             return fact_id
 
@@ -292,15 +266,6 @@ class MemoryStore:
                     self._link_fact_entity(fact_id, entity_id)
                 self._conn.commit()
 
-            # Recompute HRR vector if content changed
-            if content is not None:
-                self._compute_hrr_vector(fact_id, content)
-            # Rebuild bank for relevant category
-            cat = category or self._conn.execute(
-                "SELECT category FROM facts WHERE fact_id = ?", (fact_id,)
-            ).fetchone()["category"]
-            self._rebuild_bank(cat)
-
             return True
 
     def remove_fact(self, fact_id: int) -> bool:
@@ -317,7 +282,6 @@ class MemoryStore:
             )
             self._conn.execute("DELETE FROM facts WHERE fact_id = ?", (fact_id,))
             self._conn.commit()
-            self._rebuild_bank(row["category"])
             return True
 
     def list_facts(
@@ -470,94 +434,6 @@ class MemoryStore:
             (fact_id, entity_id),
         )
         self._conn.commit()
-
-    def _compute_hrr_vector(self, fact_id: int, content: str) -> None:
-        """Compute and store HRR vector for a fact. No-op if numpy unavailable."""
-        with self._lock:
-            if not self._hrr_available:
-                return
-
-            # Get entities linked to this fact
-            rows = self._conn.execute(
-                """
-                SELECT e.name FROM entities e
-                JOIN fact_entities fe ON fe.entity_id = e.entity_id
-                WHERE fe.fact_id = ?
-                """,
-                (fact_id,),
-            ).fetchall()
-            entities = [row["name"] for row in rows]
-
-            vector = hrr.encode_fact(content, entities, self.hrr_dim)
-            self._conn.execute(
-                "UPDATE facts SET hrr_vector = ? WHERE fact_id = ?",
-                (hrr.phases_to_bytes(vector), fact_id),
-            )
-            self._conn.commit()
-
-    def _rebuild_bank(self, category: str) -> None:
-        """Full rebuild of a category's memory bank from all its fact vectors."""
-        with self._lock:
-            if not self._hrr_available:
-                return
-
-            bank_name = f"cat:{category}"
-            rows = self._conn.execute(
-                "SELECT hrr_vector FROM facts WHERE category = ? AND hrr_vector IS NOT NULL",
-                (category,),
-            ).fetchall()
-
-            if not rows:
-                self._conn.execute("DELETE FROM memory_banks WHERE bank_name = ?", (bank_name,))
-                self._conn.commit()
-                return
-
-            vectors = [hrr.bytes_to_phases(row["hrr_vector"]) for row in rows]
-            bank_vector = hrr.bundle(*vectors)
-            fact_count = len(vectors)
-
-            # Check SNR
-            hrr.snr_estimate(self.hrr_dim, fact_count)
-
-            self._conn.execute(
-                """
-                INSERT INTO memory_banks (bank_name, vector, dim, fact_count, updated_at)
-                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(bank_name) DO UPDATE SET
-                    vector = excluded.vector,
-                    dim = excluded.dim,
-                    fact_count = excluded.fact_count,
-                    updated_at = excluded.updated_at
-                """,
-                (bank_name, hrr.phases_to_bytes(bank_vector), self.hrr_dim, fact_count),
-            )
-            self._conn.commit()
-
-    def rebuild_all_vectors(self, dim: int | None = None) -> int:
-        """Recompute all HRR vectors + banks from text. For recovery/migration.
-
-        Returns the number of facts processed.
-        """
-        with self._lock:
-            if not self._hrr_available:
-                return 0
-
-            if dim is not None:
-                self.hrr_dim = dim
-
-            rows = self._conn.execute(
-                "SELECT fact_id, content, category FROM facts"
-            ).fetchall()
-
-            categories: set[str] = set()
-            for row in rows:
-                self._compute_hrr_vector(row["fact_id"], row["content"])
-                categories.add(row["category"])
-
-            for category in categories:
-                self._rebuild_bank(category)
-
-            return len(rows)
 
     # ------------------------------------------------------------------
     # Utilities
