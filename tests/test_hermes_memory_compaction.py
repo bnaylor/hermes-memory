@@ -1,10 +1,10 @@
-# tests/test_holographic_compaction.py
+# tests/test_hermes_memory_compaction.py
 """Tests for compaction recovery: infrastructure category, config, on_session_switch, bootstrap injection."""
 
 import pytest
 from pathlib import Path
-from plugins.memory.holographic import HolographicMemoryProvider
-from plugins.memory.holographic.store import MemoryStore
+from plugins.memory.hermes_memory import HermesMemoryProvider
+from plugins.memory.hermes_memory.store import MemoryStore
 
 
 @pytest.fixture
@@ -20,7 +20,7 @@ def provider(tmp_store):
         "bootstrap_min_trust": 0.7,
         "bootstrap_shadow": False,
     }
-    p = HolographicMemoryProvider(config=config)
+    p = HermesMemoryProvider(config=config)
     p.initialize("test-session-001")
     return p
 
@@ -47,14 +47,14 @@ class TestInfrastructureCategory:
 
 class TestConfigKeys:
     def test_default_config_values(self):
-        p = HolographicMemoryProvider(config={})
+        p = HermesMemoryProvider(config={})
         assert p._config.get("bootstrap_inject_limit", 15) == 15
         assert p._config.get("bootstrap_min_trust", 0.7) == 0.7
         assert p._config.get("bootstrap_shadow", False) == False
         assert p._config.get("okf_bundle_path", "/shared/agents/common/infrastructure/") == "/shared/agents/common/infrastructure/"
 
     def test_config_keys_in_schema(self):
-        p = HolographicMemoryProvider(config={})
+        p = HermesMemoryProvider(config={})
         schema = p.get_config_schema()
         keys = {entry["key"] for entry in schema}
         assert "okf_bundle_path" in keys
@@ -132,14 +132,14 @@ class TestBootstrapInjection:
             "bootstrap_inject_limit": 5,
             "bootstrap_min_trust": 0.7,
         }
-        p = HolographicMemoryProvider(config=config)
+        p = HermesMemoryProvider(config=config)
         p.initialize("shadow-session")
         fid = tmp_store.add_fact(
             "rune-host: Runs on hive.local.", category="infrastructure", tags="bootstrap"
         )
         tmp_store.update_fact(fid, trust_delta=0.4)
         p.on_session_switch("shadow-session-002", reason="compression")
-        with caplog.at_level(logging.INFO, logger="plugins.memory.holographic"):
+        with caplog.at_level(logging.INFO, logger="plugins.memory.hermes_memory"):
             block = p.system_prompt_block()
         assert "Bootstrap Context" not in block
         assert any("BOOTSTRAP:shadow" in r.message for r in caplog.records)
@@ -151,7 +151,7 @@ class TestBootstrapInjection:
             "bootstrap_min_trust": 0.7,
             "bootstrap_shadow": False,
         }
-        p = HolographicMemoryProvider(config=config)
+        p = HermesMemoryProvider(config=config)
         p.initialize("limit-session")
         for i in range(5):
             fid = tmp_store.add_fact(
@@ -166,7 +166,7 @@ class TestBootstrapInjection:
         assert len(fact_lines) <= 2
 
     def test_flag_cleared_when_store_not_initialized(self):
-        p = HolographicMemoryProvider(config={})
+        p = HermesMemoryProvider(config={})
         # Set the flag without calling initialize() — store is None
         p._post_compaction = True
         block = p.system_prompt_block()

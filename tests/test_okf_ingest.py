@@ -246,7 +246,7 @@ class TestParseOkfConcept:
 
 import sqlite3
 import textwrap
-from plugins.memory.holographic.store import MemoryStore
+from plugins.memory.hermes_memory.store import MemoryStore
 
 
 @pytest.fixture

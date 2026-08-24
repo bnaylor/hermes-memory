@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fact store inventory — weekly health digest for memory_store.db.
 
-Reads the holographic memory store and emits a human-readable inventory:
+Reads the hermes-memory fact store and emits a human-readable inventory:
 facts per category, trust distribution, cold facts (never retrieved),
 age percentiles, growth rate, and spool pipeline health.
 

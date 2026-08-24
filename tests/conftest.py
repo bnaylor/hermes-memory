@@ -50,6 +50,6 @@ _tools_registry.tool_error = lambda msg: f'{{"error": "{msg}"}}'
 sys.modules["tools"] = _tools
 sys.modules["tools.registry"] = _tools_registry
 
-# Add project src/ and the holographic plugin tree to sys.path
+# Add project src/ and the hermes-memory plugin tree to sys.path
 _here = Path(__file__).parent
 sys.path.insert(0, str(_here.parent / "src"))
