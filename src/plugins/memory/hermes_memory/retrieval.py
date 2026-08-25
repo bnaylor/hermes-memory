@@ -130,10 +130,10 @@ class FactRetriever:
         conn = self.store._conn
 
         # Get all facts and their linked entities
-        where = ""
+        where = "WHERE f.status = 'active'"
         params: list = []
         if category:
-            where = "WHERE f.category = ?"
+            where += " AND f.category = ?"
             params.append(category)
 
         rows = conn.execute(
@@ -252,6 +252,8 @@ class FactRetriever:
 
         where_clauses.append("f.trust_score >= ?")
         params.append(min_trust)
+
+        where_clauses.append("f.status = 'active'")
 
         where_sql = " AND ".join(where_clauses)
 

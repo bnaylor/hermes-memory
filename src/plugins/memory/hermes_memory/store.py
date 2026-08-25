@@ -18,7 +18,10 @@ CREATE TABLE IF NOT EXISTS facts (
     retrieval_count INTEGER DEFAULT 0,
     helpful_count   INTEGER DEFAULT 0,
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    status          TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'retracted', 'superseded')),
+    superseded_by   INTEGER REFERENCES facts(fact_id),
+    superseded_at   TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS entities (
@@ -115,6 +118,19 @@ class MemoryStore:
         from hermes_state import apply_wal_with_fallback
         apply_wal_with_fallback(self._conn, db_label="memory_store.db (hermes-memory)")
         self._conn.executescript(_SCHEMA)
+        # Migrate: add columns missing from pre-retraction databases (idempotent).
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}
+        if "status" not in columns:
+            self._conn.execute(
+                "ALTER TABLE facts ADD COLUMN status TEXT NOT NULL DEFAULT 'active' "
+                "CHECK (status IN ('active', 'retracted', 'superseded'))"
+            )
+        if "superseded_by" not in columns:
+            self._conn.execute(
+                "ALTER TABLE facts ADD COLUMN superseded_by INTEGER REFERENCES facts(fact_id)"
+            )
+        if "superseded_at" not in columns:
+            self._conn.execute("ALTER TABLE facts ADD COLUMN superseded_at TIMESTAMP")
         self._conn.commit()
 
     # ------------------------------------------------------------------
@@ -126,12 +142,14 @@ class MemoryStore:
         content: str,
         category: str = "general",
         tags: str = "",
+        supersedes: int | None = None,
     ) -> int:
         """Insert a fact and return its fact_id.
 
         Deduplicates by content (UNIQUE constraint). On duplicate, returns
         the existing fact_id without modifying the row. Extracts entities from
-        the content and links them to the fact.
+        the content and links them to the fact. If ``supersedes`` is given, the
+        referenced fact is marked superseded atomically with this insert.
         """
         with self._lock:
             content = content.strip()
@@ -146,14 +164,21 @@ class MemoryStore:
                     """,
                     (content, category, tags, self.default_trust),
                 )
-                self._conn.commit()
                 fact_id: int = cur.lastrowid  # type: ignore[assignment]
+                if supersedes is not None:
+                    self._supersede_locked(int(supersedes), fact_id)
+                self._conn.commit()
             except sqlite3.IntegrityError:
+                self._conn.rollback()
                 # Duplicate content — return existing id
                 row = self._conn.execute(
                     "SELECT fact_id FROM facts WHERE content = ?", (content,)
                 ).fetchone()
                 return int(row["fact_id"])
+            except Exception:
+                # A failed supersession (e.g. cycle) must not leave the new fact half-written.
+                self._conn.rollback()
+                raise
 
             # Entity extraction and linking
             for name in self._extract_entities(content):
@@ -189,11 +214,12 @@ class MemoryStore:
             sql = f"""
                 SELECT f.fact_id, f.content, f.category, f.tags,
                        f.trust_score, f.retrieval_count, f.helpful_count,
-                       f.created_at, f.updated_at
+                       f.created_at, f.updated_at, f.status, f.superseded_by
                 FROM facts f
                 JOIN facts_fts fts ON fts.rowid = f.fact_id
                 WHERE facts_fts MATCH ?
                   AND f.trust_score >= ?
+                  AND f.status = 'active'
                   {category_clause}
                 ORDER BY fts.rank, f.trust_score DESC
                 LIMIT ?
@@ -284,18 +310,130 @@ class MemoryStore:
             self._conn.commit()
             return True
 
+    def _chain_reaches(self, start_id: int, target_id: int, max_hops: int = 50) -> bool:
+        """Follow ``superseded_by`` forward from start_id; True if target_id is reachable.
+
+        Bounded by max_hops and a visited-set so a corrupt (cyclic) chain fails closed
+        instead of looping forever. See docs/retraction-design.md §8.
+        """
+        visited: set[int] = set()
+        cur: int = start_id
+        for _ in range(max_hops):
+            if cur == target_id:
+                return True
+            if cur in visited:
+                return False  # pre-existing cycle that does not reach the target
+            visited.add(cur)
+            row = self._conn.execute(
+                "SELECT superseded_by FROM facts WHERE fact_id = ?", (cur,)
+            ).fetchone()
+            if row is None or row["superseded_by"] is None:
+                return False
+            cur = int(row["superseded_by"])
+        return False  # exceeded hop cap — treated as a cycle anomaly
+
+    def _supersede_locked(self, fact_id: int, by_fact_id: int) -> str:
+        """Mark ``fact_id`` superseded by ``by_fact_id``. Returns the superseded fact's category.
+
+        Assumes ``self._lock`` is held and does NOT commit — the caller controls the
+        transaction boundary (this is what makes ``add(supersedes=…)`` atomic).
+        Raises ValueError on self-supersession, unknown ids, or a would-be cycle.
+        """
+        if fact_id == by_fact_id:
+            raise ValueError(f"cannot supersede a fact with itself (fact_id={fact_id})")
+        target = self._conn.execute(
+            "SELECT fact_id, category FROM facts WHERE fact_id = ?", (fact_id,)
+        ).fetchone()
+        if target is None:
+            raise ValueError(f"fact_id {fact_id} does not exist")
+        by_row = self._conn.execute(
+            "SELECT fact_id FROM facts WHERE fact_id = ?", (by_fact_id,)
+        ).fetchone()
+        if by_row is None:
+            raise ValueError(f"by_fact_id {by_fact_id} does not exist")
+        if self._chain_reaches(by_fact_id, fact_id):
+            raise ValueError(
+                f"supersession would create a cycle: fact {by_fact_id} already leads to {fact_id}"
+            )
+        self._conn.execute(
+            "UPDATE facts SET status = 'superseded', superseded_by = ?, "
+            "superseded_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP "
+            "WHERE fact_id = ?",
+            (by_fact_id, fact_id),
+        )
+        return str(target["category"])
+
+    def supersede_fact(self, fact_id: int, by_fact_id: int) -> dict:
+        """Mark ``fact_id`` superseded by ``by_fact_id``. Raises ValueError on invalid input."""
+        with self._lock:
+            self._supersede_locked(fact_id, by_fact_id)
+            self._conn.commit()
+        return {"fact_id": fact_id, "status": "superseded", "superseded_by": by_fact_id}
+
+    def retract_fact(self, fact_id: int) -> dict:
+        """Mark a fact as no longer true (no replacement). Raises ValueError if missing."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT fact_id, category FROM facts WHERE fact_id = ?", (fact_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"fact_id {fact_id} does not exist")
+            self._conn.execute(
+                "UPDATE facts SET status = 'retracted', superseded_by = NULL, "
+                "superseded_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP "
+                "WHERE fact_id = ?",
+                (fact_id,),
+            )
+            self._conn.commit()
+        return {"fact_id": fact_id, "status": "retracted"}
+
+    def restore_fact(self, fact_id: int) -> dict:
+        """Re-activate a retracted/superseded fact. Names any still-active successor.
+
+        Restoring a mid-chain node leaves the forward tail active and detached (by design);
+        the response lists it under ``still_active`` so the operator can retract it if stale.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT fact_id, category, superseded_by FROM facts WHERE fact_id = ?", (fact_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"fact_id {fact_id} does not exist")
+            old_successor = row["superseded_by"]
+            self._conn.execute(
+                "UPDATE facts SET status = 'active', superseded_by = NULL, "
+                "superseded_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE fact_id = ?",
+                (fact_id,),
+            )
+            self._conn.commit()
+        still_active: list[dict] = []
+        if old_successor is not None:
+            successor = self._conn.execute(
+                "SELECT fact_id, content, status FROM facts WHERE fact_id = ?", (old_successor,)
+            ).fetchone()
+            if successor is not None and successor["status"] == "active":
+                still_active.append({"fact_id": successor["fact_id"], "content": successor["content"]})
+        result: dict = {"fact_id": fact_id, "status": "active"}
+        if still_active:
+            result["still_active"] = still_active
+        return result
+
     def list_facts(
         self,
         category: str | None = None,
         min_trust: float = 0.0,
         limit: int = 50,
+        include_inactive: bool = False,
     ) -> list[dict]:
         """Browse facts ordered by trust_score descending.
 
-        Optionally filter by category and minimum trust score.
+        Optionally filter by category and minimum trust score. By default only
+        active facts are returned; pass ``include_inactive=True`` to also list
+        retracted/superseded facts (rows carry their ``status``).
         """
         with self._lock:
             params: list = [min_trust]
+            status_clause = "" if include_inactive else "AND status = 'active'"
             category_clause = ""
             if category is not None:
                 category_clause = "AND category = ?"
@@ -304,9 +442,11 @@ class MemoryStore:
 
             sql = f"""
                 SELECT fact_id, content, category, tags, trust_score,
-                       retrieval_count, helpful_count, created_at, updated_at
+                       retrieval_count, helpful_count, created_at, updated_at,
+                       status, superseded_by
                 FROM facts
                 WHERE trust_score >= ?
+                  {status_clause}
                   {category_clause}
                 ORDER BY trust_score DESC
                 LIMIT ?
