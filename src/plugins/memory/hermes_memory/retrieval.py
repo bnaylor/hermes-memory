@@ -212,6 +212,47 @@ class FactRetriever:
         contradictions.sort(key=lambda x: x["contradiction_score"], reverse=True)
         return contradictions[:limit]
 
+    def shadow_probe(
+        self,
+        query: str,
+        min_trust: float = 0.5,
+        limit: int = 5,
+        jaccard_threshold: float = 0.2,
+    ) -> tuple[int, int | None, float, list[dict]]:
+        """Non-injecting overlap probe for the shadow-retrieval instrument.
+
+        Returns ``(matched_count, top_fact_id, top_jaccard, matches)``. Unlike
+        ``search()`` it never calls ``_increment_retrievals`` — the probe
+        measures *opportunity* (could the store have helped) and must not
+        pollute the ``retrieval_count`` (surfacings) signal it is measured
+        against.
+
+        Matching uses Jaccard token overlap (an absolute, query-independent
+        measure) over the trust-floor-filtered top-K FTS candidates, so a fixed
+        threshold means the same thing across turns — unlike FTS rank, which is
+        normalized per candidate set and cannot distinguish "great match" from
+        "best of a bad lot".
+        """
+        candidates = self._fts_candidates(query, None, min_trust, limit)
+        if not candidates:
+            return 0, None, 0.0, []
+
+        query_tokens = self._tokenize(query)
+        matches: list[tuple[float, dict]] = []
+        for fact in candidates:
+            tokens = self._tokenize(fact["content"]) | self._tokenize(fact.get("tags", ""))
+            jaccard = self._jaccard_similarity(query_tokens, tokens)
+            if jaccard >= jaccard_threshold:
+                matches.append((jaccard, fact))
+
+        if not matches:
+            return 0, None, 0.0, []
+
+        matches.sort(key=lambda item: item[0], reverse=True)
+        top_jaccard, top_fact = matches[0]
+        top_fact_id = top_fact.get("fact_id")
+        return len(matches), top_fact_id, top_jaccard, [f for _, f in matches]
+
     def _increment_retrievals(self, results: list[dict]) -> None:
         """Increment retrieval_count for every fact in the result set."""
         if not results:

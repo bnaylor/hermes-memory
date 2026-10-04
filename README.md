@@ -208,6 +208,7 @@ fact_store(action="search", query="deploy process")
 | `bootstrap_inject_limit` | `15` | Max facts re-injected after compaction. |
 | `bootstrap_min_trust` | `0.7` | Minimum trust for compaction re-injection. |
 | `bootstrap_shadow` | `false` | Log what would inject without injecting. |
+| `shadow_retrieval` | `false` | Log per-turn retrieval opportunities (non-injecting probe). |
 
 ## Project Structure
 

@@ -61,6 +61,37 @@ CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE ON facts BEGIN
     INSERT INTO facts_fts(rowid, content, tags)
         VALUES (new.fact_id, new.content, new.tags);
 END;
+
+-- Retrieval-attempt telemetry: one row per fact_store tool invocation.
+-- Separates "the tool was invoked" from "a fact surfaced", so the inventory
+-- can distinguish never-invoked (behavioral) from recall-miss (retriever
+-- quality) — the two states retrieval_count == 0 otherwise welds together.
+CREATE TABLE IF NOT EXISTS retrieval_attempts (
+    attempt_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    action      TEXT NOT NULL,
+    query       TEXT,
+    session_id  TEXT,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_retrieval_attempts_ts ON retrieval_attempts(created_at);
+
+-- Shadow-retrieval telemetry: one row per turn while the shadow probe is
+-- enabled. matched_count/top_fact_id/top_jaccard record whether the turn had
+-- high-confidence fact overlap ("opportunity"); demand_satisfied records
+-- whether the agent actually invoked a retrieval action that turn. The report
+-- computes opportunity-minus-demand (blind turns) from these two signals.
+CREATE TABLE IF NOT EXISTS retrieval_opportunities (
+    opportunity_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id       TEXT,
+    matched_count    INTEGER NOT NULL DEFAULT 0,
+    top_fact_id      INTEGER,
+    top_jaccard      REAL,
+    demand_satisfied INTEGER NOT NULL DEFAULT 0,
+    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_retrieval_opportunities_ts ON retrieval_opportunities(created_at);
 """
 
 # Trust adjustment constants
@@ -81,6 +112,13 @@ _RE_AKA          = re.compile(
 
 def _clamp_trust(value: float) -> float:
     return max(_TRUST_MIN, min(_TRUST_MAX, value))
+
+
+# fact_store actions that *ask the store for facts* (vs. writes like add/update,
+# or maintenance like contradict). Used by latest_attempt_id() for shadow-probe
+# demand detection — a "retrieval" is the demand the opportunity probe is
+# measured against.
+_RETRIEVAL_ACTIONS = ("search", "probe", "related", "reason")
 
 
 class MemoryStore:
@@ -238,6 +276,87 @@ class MemoryStore:
                 self._conn.commit()
 
             return results
+
+    def record_attempt(
+        self,
+        action: str,
+        query: str | None = None,
+        session_id: str | None = None,
+    ) -> None:
+        """Record one fact_store tool invocation.
+
+        Best-effort telemetry: a failed write must never break the tool call
+        it instruments. ``retrieval_attempts`` is created by ``_SCHEMA`` on
+        ``_init_db``, so the table exists whenever a tool handler runs; the
+        try/except guards the edge where the store is read-only or the table
+        is absent.
+        """
+        try:
+            with self._lock:
+                self._conn.execute(
+                    "INSERT INTO retrieval_attempts (action, query, session_id) "
+                    "VALUES (?, ?, ?)",
+                    (action, query, session_id),
+                )
+                self._conn.commit()
+        except Exception:
+            pass
+
+    def latest_attempt_id(
+        self,
+        session_id: str | None,
+        actions: tuple = _RETRIEVAL_ACTIONS,
+    ) -> int:
+        """Highest ``retrieval_attempts.attempt_id`` for a session among ``actions``.
+
+        Returns 0 when there is no matching row. This is the shadow probe's
+        demand signal: a new retrieval action since the previous ``sync_turn``
+        means the agent *did* invoke the tool this turn. Read-only and never
+        raises (mirrors ``record_attempt``'s best-effort posture).
+        """
+        try:
+            with self._lock:
+                placeholders = ",".join("?" * len(actions))
+                row = self._conn.execute(
+                    f"SELECT MAX(attempt_id) AS m FROM retrieval_attempts "
+                    f"WHERE session_id = ? AND action IN ({placeholders})",
+                    (session_id, *actions),
+                ).fetchone()
+                return int(row["m"] or 0)
+        except Exception:
+            return 0
+
+    def record_opportunity(
+        self,
+        session_id: str | None = None,
+        matched_count: int = 0,
+        top_fact_id: int | None = None,
+        top_jaccard: float | None = None,
+        demand_satisfied: bool = False,
+    ) -> None:
+        """Record one shadow-retrieval probe result (best-effort telemetry).
+
+        ``retrieval_opportunities`` is created by ``_SCHEMA`` on ``_init_db``;
+        the try/except mirrors ``record_attempt`` so a telemetry failure never
+        breaks the turn it instruments.
+        """
+        try:
+            with self._lock:
+                self._conn.execute(
+                    "INSERT INTO retrieval_opportunities "
+                    "(session_id, matched_count, top_fact_id, top_jaccard, "
+                    "demand_satisfied) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        session_id,
+                        matched_count,
+                        top_fact_id,
+                        top_jaccard,
+                        1 if demand_satisfied else 0,
+                    ),
+                )
+                self._conn.commit()
+        except Exception:
+            pass
 
     def update_fact(
         self,
