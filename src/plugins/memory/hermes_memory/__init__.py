@@ -31,6 +31,16 @@ from hermes_cli.config import cfg_get
 logger = logging.getLogger(__name__)
 
 
+# Shadow-retrieval (opportunity) probe knobs. The master switch is the
+# ``shadow_retrieval`` config flag (default off); these tune the probe when it
+# is on. Kept as constants rather than config to keep the config surface small
+# — they are measurement tuning, not behaviour a user toggles.
+_SHADOW_MIN_TRUST = 0.5       # trust floor for candidate facts
+_SHADOW_TOP_K = 5             # probe breadth (FTS candidates examined)
+_SHADOW_JACCARD_THRESHOLD = 0.2  # min token overlap to count as an "opportunity"
+
+
+
 # ---------------------------------------------------------------------------
 # Tool schemas (unchanged from original PR)
 # ---------------------------------------------------------------------------
@@ -124,9 +134,14 @@ class HermesMemoryProvider(MemoryProvider):
         self._config = config or _load_plugin_config()
         self._store = None
         self._retriever = None
+        self._session_id = ""
         self._min_trust = float(self._config.get("min_trust_threshold", 0.3))
         self._post_compaction: bool = False
         self._post_compaction_parent: str = ""
+        self._shadow_retrieval = bool(self._config.get("shadow_retrieval", False))
+        # Per-session high-water mark of retrieval_attempts.attempt_id, used to
+        # detect "did the agent retrieve this turn" without a time query.
+        self._shadow_seen_attempt_id: Dict[str, int] = {}
 
     @property
     def name(self) -> str:
@@ -163,6 +178,7 @@ class HermesMemoryProvider(MemoryProvider):
             {"key": "bootstrap_inject_limit", "description": "Max facts injected after context compression",          "default": "15"},
             {"key": "bootstrap_min_trust",    "description": "Minimum trust score for post-compaction injection",     "default": "0.7"},
             {"key": "bootstrap_shadow",       "description": "Log what would inject without injecting (shadow mode)", "default": "false", "choices": ["true", "false"]},
+            {"key": "shadow_retrieval",       "description": "Log per-turn retrieval opportunities (non-injecting probe)", "default": "false", "choices": ["true", "false"]},
         ]
 
     def initialize(self, session_id: str, **kwargs) -> None:
@@ -342,7 +358,54 @@ class HermesMemoryProvider(MemoryProvider):
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         # The fact store persists explicit facts via tools, not auto-sync.
         # The on_session_end hook handles auto-extraction if configured.
-        pass
+        #
+        # When shadow_retrieval is enabled, this hook doubles as the shadow
+        # (opportunity) probe: measure — without injecting — whether this turn
+        # had high-confidence fact overlap, and whether the agent actually
+        # retrieved. Opt-in (default off) and best-effort; a probe failure must
+        # never surface to the turn.
+        if not self._shadow_retrieval:
+            return
+        if not self._store or not self._retriever:
+            return
+        try:
+            self._shadow_probe_turn(user_content, session_id)
+        except Exception as exc:
+            logger.debug("shadow retrieval probe failed: %s", exc)
+
+    def _shadow_probe_turn(self, user_content: str, session_id: str) -> None:
+        """Run one bounded, non-injecting opportunity probe and log the result."""
+        store = self._store
+        retriever = self._retriever
+        if store is None or retriever is None:
+            return
+        sid = session_id or self._session_id
+
+        # Demand: a new retrieval action since the last sync_turn means the
+        # agent invoked the tool this turn.
+        prev = self._shadow_seen_attempt_id.get(sid, 0)
+        cur = store.latest_attempt_id(sid)
+        demand_satisfied = cur > prev
+        self._shadow_seen_attempt_id[sid] = cur
+
+        content = (user_content or "").strip()
+        if content:
+            matched_count, top_fact_id, top_jaccard, _ = retriever.shadow_probe(
+                content,
+                min_trust=_SHADOW_MIN_TRUST,
+                limit=_SHADOW_TOP_K,
+                jaccard_threshold=_SHADOW_JACCARD_THRESHOLD,
+            )
+        else:
+            matched_count, top_fact_id, top_jaccard = 0, None, 0.0
+
+        store.record_opportunity(
+            session_id=sid,
+            matched_count=matched_count,
+            top_fact_id=top_fact_id,
+            top_jaccard=top_jaccard,
+            demand_satisfied=demand_satisfied,
+        )
 
     def on_session_switch(
         self,
@@ -435,11 +498,38 @@ class HermesMemoryProvider(MemoryProvider):
 
     # -- Tool handlers -------------------------------------------------------
 
+    def _attempt_query(self, action: str, args: dict) -> str | None:
+        """Best-effort query string for the retrieval-attempt log.
+
+        Captures what was asked for retrieval actions; ``None`` for write
+        actions (add/update/remove/…) where "query" has no meaning.
+        """
+        if action == "search":
+            return args.get("query")
+        if action in ("probe", "related"):
+            return args.get("entity")
+        if action == "reason":
+            entities = args.get("entities") or []
+            return " ".join(entities) if entities else None
+        if action == "contradict":
+            return args.get("category")
+        return None
+
     def _handle_fact_store(self, args: dict) -> str:
         try:
             action = args["action"]
             store = self._store
             retriever = self._retriever
+
+            # Record the invocation before dispatch (retrieval-attempt
+            # telemetry) so "was the tool invoked" is measured independently of
+            # "did any fact surface".
+            if store is not None:
+                store.record_attempt(
+                    action,
+                    self._attempt_query(action, args),
+                    self._session_id,
+                )
 
             if action == "add":
                 fact_id = store.add_fact(

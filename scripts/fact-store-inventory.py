@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Fact store inventory — weekly health digest for memory_store.db.
 
-Reads the hermes-memory fact store and emits a human-readable inventory:
-facts per category, trust distribution, cold facts (never retrieved),
-age percentiles, growth rate, and spool pipeline health.
+Reads the holographic memory store and emits a human-readable inventory:
+facts per category, trust distribution, cold facts (never surfaced, split
+into never-invoked vs recall-miss), retrieval telemetry (invocations vs
+surfacings), age percentiles, growth rate, and spool pipeline health.
 
 Usage:
     python3 fact-store-inventory.py [--db PATH] [--spool PATH] [--json]
@@ -27,6 +28,10 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+# Actions that constitute "retrieval" (as opposed to write/CRUD actions).
+# Matches the action set the hermes-memory plugin records in retrieval_attempts.
+_RETRIEVAL_ACTIONS = ("search", "probe", "related", "reason", "contradict")
 
 
 def get_default_paths() -> tuple[Path, Path]:
@@ -72,12 +77,39 @@ def collect_stats(db_path: Path, spool_path: Path) -> dict:
         tiers = {"0.9+": row["t09"] or 0, "0.7": row["t07"] or 0, "0.5": row["t05"] or 0}
 
     # ── Retrieval health ──────────────────────────────────────────────
+    # retrieval_count == 0 ("cold") welds two states into one number:
+    #   (1) never invoked  — the agent never called the retrieval tool
+    #   (2) recall miss    — the tool was called but this fact never ranked top-K
+    # The retrieval_attempts table (added by the plugin) disambiguates them.
     never_retrieved = _count(conn, "SELECT COUNT(*) FROM facts WHERE retrieval_count = 0")
-    total_searches = _count(conn, "SELECT COALESCE(SUM(retrieval_count), 0) FROM facts")
+    surfacings = _count(conn, "SELECT COALESCE(SUM(retrieval_count), 0) FROM facts")
+    surfaced_unconfirmed = _count(
+        conn,
+        "SELECT COUNT(*) FROM facts WHERE retrieval_count > 0 AND helpful_count = 0",
+    )
     most_retrieved = conn.execute(
-        "SELECT fact_id, content, retrieval_count FROM facts "
+        "SELECT fact_id, content, retrieval_count, helpful_count FROM facts "
         "ORDER BY retrieval_count DESC LIMIT 5"
     ).fetchall()
+
+    # retrieval_attempts may be absent if the plugin has not been re-deployed
+    # since the schema change — fall back to 0 (and report "never-invoked").
+    invocations = 0
+    invocations_total = 0
+    has_attempts = (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='retrieval_attempts'"
+        ).fetchone()
+        is not None
+    )
+    if has_attempts:
+        placeholders = ",".join("?" * len(_RETRIEVAL_ACTIONS))
+        invocations = _count(
+            conn,
+            f"SELECT COUNT(*) FROM retrieval_attempts WHERE action IN ({placeholders})",
+            _RETRIEVAL_ACTIONS,
+        )
+        invocations_total = _count(conn, "SELECT COUNT(*) FROM retrieval_attempts")
 
     # ── Age distribution ──────────────────────────────────────────────
     ages_days = [
@@ -140,7 +172,10 @@ def collect_stats(db_path: Path, spool_path: Path) -> dict:
         "trust_tiers": tiers,
         "never_retrieved": never_retrieved,
         "never_retrieved_pct": never_retrieved / total * 100 if total else 0,
-        "total_searches": total_searches,
+        "surfacings": surfacings,
+        "invocations": invocations,
+        "invocations_total": invocations_total,
+        "surfaced_unconfirmed": surfaced_unconfirmed,
         "most_retrieved": [dict(r) for r in most_retrieved],
         "age_p50": p50,
         "age_p90": p90,
@@ -168,14 +203,35 @@ def format_stats(stats: dict) -> str:
     for cat, n in sorted(stats["categories"].items(), key=lambda x: -x[1]):
         lines.append(f"| {cat} | {n} |")
 
+    # Split "cold" (retrieval_count == 0) into never-invoked vs recall-miss.
+    # invocations == 0 means the retrieval tool has never been called since the
+    # attempt counter was added, so every cold fact is "never given a chance"
+    # (a behavioral signal) rather than "tested and rejected" (a fact-quality
+    # signal). Only the latter is a pruning signal.
+    if stats["invocations"] == 0:
+        cold_note = (
+            "never-invoked — the retrieval tool has not been called since the "
+            "attempt counter was added; cold here is a behavioral signal, not a "
+            "fact-quality signal"
+        )
+    else:
+        cold_note = (
+            f"recall-miss — never surfaced despite {stats['invocations']} "
+            "retrieval invocations"
+        )
+
     lines += [
         "",
         f"**By trust tier:** 0.9+={stats['trust_tiers']['0.9+']}, "
         f"0.7={stats['trust_tiers']['0.7']}, 0.5={stats['trust_tiers']['0.5']}",
         "",
-        f"**Never retrieved:** {stats['never_retrieved']} "
-        f"({stats['never_retrieved_pct']:.0f}%) — cold facts, candidates for removal",
-        f"**Total retrievals:** {stats['total_searches']}",
+        "**Retrieval telemetry:**",
+        f"  - Invocations (search/probe/related/reason/contradict): {stats['invocations']}",
+        f"  - Surfacings (Σ retrieval_count): {stats['surfacings']}",
+        f"  - Cold facts (never surfaced): {stats['never_retrieved']} "
+        f"({stats['never_retrieved_pct']:.0f}%) — {cold_note}",
+        f"  - Surfaced but unconfirmed (helpful_count == 0): {stats['surfaced_unconfirmed']} "
+        "(proxy for 'surfaced and ignored')",
         "",
         f"**Age:** p50={stats['age_p50']}d, p90={stats['age_p90']}d, max={stats['age_max']}d",
         f"**Growth:** +{stats['added_this_week']} this week "
